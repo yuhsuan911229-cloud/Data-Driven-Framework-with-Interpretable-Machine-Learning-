@@ -1,1 +1,1099 @@
+# ============================================================
+# Random Forest Regression - Overpotential
+# Separate P/A or Ratio dataset
+#
+# Validation:
+# - Nested Grouped Cross-Validation
+# - Outer 5-fold + Inner 3-fold
+# - Literature-grouped splitting by Reference
+# - Univariate hyperparameter tuning in inner CV
+# - Pooled OOF evaluation
+# - Literature-level bootstrap 95% CI
+#
+# Final model:
+# - Full-data 3-fold literature-grouped tuning
+# - Refit on 100% data with selected hyperparameter
+# - SHAP analysis
+#
+# IMPORTANT:
+# - P/A and Ratio are separate datasets.
+# - Set DATASET_TYPE = "PA" or "RATIO".
+# - Random Forest does NOT use feature scaling.
+# - Categorical encoding is fitted inside each training fold.
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from matplotlib.colors import LinearSegmentedColormap
+
+
+# ============================================================
+# 1. BASIC SETTINGS
+# ============================================================
+
+# Choose which dataset to run:
+# "PA"    -> P_A.csv
+# "RATIO" -> Ratio.csv
+DATASET_TYPE = "PA"
+
+PA_FILE_PATH = "P_A.csv"
+RATIO_FILE_PATH = "Ratio.csv"
+SHEET_NAME = None
+
+TARGET_COLUMN = "Overpotential at 10mA/cm2"
+GROUP_COLUMN = "Reference"
+SAMPLE_COLUMN = "Index"
+
+OUTER_FOLDS = 5
+INNER_FOLDS = 3
+RANDOM_STATE = 42
+
+BOOTSTRAP_N = 2000
+BOOTSTRAP_CI = 95
+BOOTSTRAP_RANDOM_STATE = 42
+
+# Additional evaluation for |Actual OP| <= 300 mV.
+# Set None to disable.
+EVAL_ABS_TARGET_MAX = 300.0
+
+
+# ============================================================
+# 2. RF HYPERPARAMETERS
+# ============================================================
+
+# Fixed parameters. Only one parameter below is varied at a time.
+BASE_PARAMS = {
+    "n_estimators": 500,
+    "max_depth": 10,
+    "min_samples_split": 2,
+    "min_samples_leaf": 3,
+    "max_features": 1.0,
+    "bootstrap": True,
+    "random_state": RANDOM_STATE,
+    "n_jobs": -1,
+}
+
+# Univariate tuning
+UNIVARIATE_PARAM_NAME = "max_depth"
+UNIVARIATE_PARAM_VALUES = [2, 4, 6, 8, 10, 12, 15, 20]
+
+# "RMSE", "MAE", or "R2"
+TUNING_METRIC = "RMSE"
+PRINT_INNER_DETAILS = True
+
+
+# ============================================================
+# 3. SHAP SETTINGS
+# ============================================================
+
+RUN_FINAL_SHAP = True
+SHAP_RANDOM_STATE = 42
+SHAP_EXPLAIN_SIZE = None
+SHAP_MAX_DISPLAY = 11
+
+SHAP_BAR_COLOR = "#FF0051"
+SHAP_CMAP = LinearSegmentedColormap.from_list(
+    "shap_blue_red",
+    ["#008BFB", "#8B00FF", "#FF0051"]
+)
+
+
+# ============================================================
+# 4. FEATURES
+# ============================================================
+
+COMMON_FEATURES = [
+    "Substrate",
+    "Temperature",
+    "Electrolyte",
+    "Concentration",
+    "IR compensation",
+]
+
+ELEMENT_FEATURES = [
+    "Ni", "Mo", "Co", "Fe", "Cu", "Al", "Pt", "NiO", "V", "W",
+    "N", "Pd", "S", "Cr", "Ni(OH)2", "Ag", "C", "Zr", "Ru", "Nb","B","Zn"
+]
+
+FEATURE_COLUMNS = COMMON_FEATURES + ELEMENT_FEATURES
+CATEGORICAL_FEATURES = ["Substrate", "Electrolyte"]
+
+
+# ============================================================
+# 5. SELECT DATASET
+# ============================================================
+
+if DATASET_TYPE.upper() == "PA":
+    FILE_PATH = PA_FILE_PATH
+    REPRESENTATION_NAME = "Presence/Absence"
+elif DATASET_TYPE.upper() == "RATIO":
+    FILE_PATH = RATIO_FILE_PATH
+    REPRESENTATION_NAME = "Ratio"
+else:
+    raise ValueError('DATASET_TYPE must be "PA" or "RATIO".')
+
+
+# ============================================================
+# 6. HELPER FUNCTIONS
+# ============================================================
+
+def read_dataset(file_path):
+    if file_path.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(file_path, sheet_name=SHEET_NAME)
+    return pd.read_csv(file_path)
+
+
+def regression_metrics(y_true, y_pred):
+    return {
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "R2": r2_score(y_true, y_pred),
+    }
+
+
+def build_pipeline(rf_params, feature_columns):
+    """
+    Leakage-safe preprocessing:
+    - Numerical features: passthrough, no scaling
+    - Categorical features: OrdinalEncoder fitted only on training fold
+    - RF fitted only on training fold
+    """
+    numerical_features = [
+        c for c in feature_columns if c not in CATEGORICAL_FEATURES
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", numerical_features),
+            (
+                "cat",
+                OrdinalEncoder(
+                    handle_unknown="use_encoded_value",
+                    unknown_value=-1
+                ),
+                CATEGORICAL_FEATURES,
+            ),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+    model = RandomForestRegressor(**rf_params)
+
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("rf", model),
+    ])
+
+
+def tune_one_parameter_nested(
+    X_train,
+    y_train,
+    groups_train,
+    feature_columns,
+    outer_fold_label,
+):
+    """Inner 3-fold literature-grouped univariate tuning."""
+
+    unique_groups = np.unique(groups_train)
+    if len(unique_groups) < INNER_FOLDS:
+        raise ValueError(
+            f"{outer_fold_label}: only {len(unique_groups)} unique publications "
+            f"are available for INNER_FOLDS={INNER_FOLDS}."
+        )
+
+    inner_cv = GroupKFold(n_splits=INNER_FOLDS)
+    candidate_records = []
+
+    print("\n" + "-" * 70)
+    print(f"{outer_fold_label} - INNER {INNER_FOLDS}-FOLD GROUPED TUNING")
+    print("-" * 70)
+    print(f"Tuning parameter : {UNIVARIATE_PARAM_NAME}")
+    print(f"Candidates       : {UNIVARIATE_PARAM_VALUES}")
+    print(f"Selection metric : {TUNING_METRIC}")
+
+    for candidate in UNIVARIATE_PARAM_VALUES:
+        fold_results = []
+
+        current_params = BASE_PARAMS.copy()
+        current_params[UNIVARIATE_PARAM_NAME] = candidate
+
+        for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(
+            inner_cv.split(X_train, y_train, groups_train), start=1
+        ):
+            X_inner_train = X_train.iloc[inner_train_idx].copy()
+            X_inner_val = X_train.iloc[inner_val_idx].copy()
+            y_inner_train = y_train[inner_train_idx]
+            y_inner_val = y_train[inner_val_idx]
+            g_inner_train = groups_train[inner_train_idx]
+            g_inner_val = groups_train[inner_val_idx]
+
+            overlap = set(g_inner_train) & set(g_inner_val)
+            if overlap:
+                raise ValueError(
+                    f"{outer_fold_label}, inner fold {inner_fold}: "
+                    f"publication leakage detected: {overlap}"
+                )
+
+            pipeline = build_pipeline(current_params, feature_columns)
+            pipeline.fit(X_inner_train, y_inner_train)
+            y_inner_pred = pipeline.predict(X_inner_val)
+
+            m = regression_metrics(y_inner_val, y_inner_pred)
+            fold_results.append(m)
+
+            if PRINT_INNER_DETAILS:
+                print(
+                    f"{UNIVARIATE_PARAM_NAME}={candidate} | "
+                    f"Inner Fold {inner_fold} | "
+                    f"MAE={m['MAE']:.4f}, "
+                    f"RMSE={m['RMSE']:.4f}, "
+                    f"R2={m['R2']:.4f}"
+                )
+
+        mean_mae = np.mean([m["MAE"] for m in fold_results])
+        sd_mae = np.std([m["MAE"] for m in fold_results], ddof=1)
+        mean_rmse = np.mean([m["RMSE"] for m in fold_results])
+        sd_rmse = np.std([m["RMSE"] for m in fold_results], ddof=1)
+        mean_r2 = np.mean([m["R2"] for m in fold_results])
+        sd_r2 = np.std([m["R2"] for m in fold_results], ddof=1)
+
+        candidate_records.append({
+            "Outer_Fold": outer_fold_label,
+            "Parameter": UNIVARIATE_PARAM_NAME,
+            "Candidate": candidate,
+            "Mean_MAE": mean_mae,
+            "SD_MAE": sd_mae,
+            "Mean_RMSE": mean_rmse,
+            "SD_RMSE": sd_rmse,
+            "Mean_R2": mean_r2,
+            "SD_R2": sd_r2,
+        })
+
+        print(
+            f"  -> {UNIVARIATE_PARAM_NAME}={candidate}: "
+            f"Mean MAE={mean_mae:.4f}, "
+            f"Mean RMSE={mean_rmse:.4f}, "
+            f"Mean R2={mean_r2:.4f}"
+        )
+
+    tuning_df = pd.DataFrame(candidate_records)
+    metric_upper = TUNING_METRIC.upper()
+
+    if metric_upper == "RMSE":
+        best_idx = tuning_df["Mean_RMSE"].astype(float).idxmin()
+        best_score = tuning_df.loc[best_idx, "Mean_RMSE"]
+    elif metric_upper == "MAE":
+        best_idx = tuning_df["Mean_MAE"].astype(float).idxmin()
+        best_score = tuning_df.loc[best_idx, "Mean_MAE"]
+    elif metric_upper == "R2":
+        best_idx = tuning_df["Mean_R2"].astype(float).idxmax()
+        best_score = tuning_df.loc[best_idx, "Mean_R2"]
+    else:
+        raise ValueError('TUNING_METRIC must be "RMSE", "MAE", or "R2".')
+
+    best_value = tuning_df.loc[best_idx, "Candidate"]
+
+    print("\nSelected hyperparameter:")
+    print(f"{UNIVARIATE_PARAM_NAME} = {best_value}")
+    print(f"Best mean {TUNING_METRIC} = {best_score:.6f}")
+
+    return best_value, tuning_df
+
+
+def literature_bootstrap_ci(
+    prediction_df,
+    group_column,
+    n_bootstrap=2000,
+    ci=95,
+    random_state=42,
+):
+    """Literature-level cluster bootstrap on pooled OOF predictions."""
+
+    rng = np.random.default_rng(random_state)
+    unique_groups = prediction_df[group_column].dropna().unique()
+
+    if len(unique_groups) < 2:
+        raise ValueError("At least two publications are required for bootstrap CI.")
+
+    records = []
+
+    for _ in range(n_bootstrap):
+        sampled_groups = rng.choice(
+            unique_groups,
+            size=len(unique_groups),
+            replace=True
+        )
+
+        blocks = []
+        for sampled_group in sampled_groups:
+            blocks.append(
+                prediction_df[prediction_df[group_column] == sampled_group]
+            )
+
+        boot = pd.concat(blocks, ignore_index=True)
+        yt = boot["Actual"].to_numpy()
+        yp = boot["Predicted"].to_numpy()
+
+        mae = mean_absolute_error(yt, yp)
+        rmse = np.sqrt(mean_squared_error(yt, yp))
+
+        if len(yt) >= 2 and np.var(yt) > 0:
+            r2 = r2_score(yt, yp)
+        else:
+            r2 = np.nan
+
+        records.append({"MAE": mae, "RMSE": rmse, "R2": r2})
+
+    boot_df = pd.DataFrame(records)
+    alpha = (100 - ci) / 2
+    ci_result = {}
+
+    for metric in ["MAE", "RMSE", "R2"]:
+        values = boot_df[metric].dropna().to_numpy()
+        ci_result[metric] = {
+            "Lower": np.percentile(values, alpha),
+            "Upper": np.percentile(values, 100 - alpha),
+        }
+
+    return ci_result, boot_df
+
+
+def print_metric_with_ci(metric_name, point_value, ci_dict):
+    lower = ci_dict[metric_name]["Lower"]
+    upper = ci_dict[metric_name]["Upper"]
+    print(
+        f"{metric_name:<4} = {point_value:.4f} "
+        f"(95% CI: {lower:.4f} to {upper:.4f})"
+    )
+
+
+# ============================================================
+# 7. READ DATA
+# ============================================================
+
+df = read_dataset(FILE_PATH)
+
+print("=" * 70)
+print("DATASET INFORMATION")
+print("=" * 70)
+print(f"Representation       : {REPRESENTATION_NAME}")
+print(f"File                 : {FILE_PATH}")
+print(f"Target               : {TARGET_COLUMN}")
+print(f"Total samples        : {len(df)}")
+
+if GROUP_COLUMN not in df.columns:
+    raise ValueError(f"{GROUP_COLUMN} does not exist in the dataset.")
+
+print(f"Total publications   : {df[GROUP_COLUMN].nunique(dropna=True)}")
+
+
+# ============================================================
+# 8. COLUMN CHECK
+# ============================================================
+
+required_columns = [GROUP_COLUMN, SAMPLE_COLUMN, TARGET_COLUMN] + FEATURE_COLUMNS
+missing_columns = [c for c in required_columns if c not in df.columns]
+
+if missing_columns:
+    raise ValueError(
+        "The following required columns do not exist:\n" +
+        "\n".join(missing_columns)
+    )
+
+if df[GROUP_COLUMN].isna().any():
+    raise ValueError(
+        f"{GROUP_COLUMN} contains missing values; grouped CV cannot be performed."
+    )
+
+if df[SAMPLE_COLUMN].duplicated().any():
+    duplicated_ids = df.loc[
+        df[SAMPLE_COLUMN].duplicated(), SAMPLE_COLUMN
+    ].astype(str).tolist()
+    raise ValueError(
+        f"{SAMPLE_COLUMN} contains duplicated sample IDs:\n" +
+        "\n".join(duplicated_ids[:20])
+    )
+
+
+# ============================================================
+# 9. REMOVE MISSING TARGET
+# ============================================================
+
+df_model = df.dropna(subset=[TARGET_COLUMN]).copy().reset_index(drop=True)
+
+print("\nAfter removing missing target:")
+print(f"Samples used         : {len(df_model)}")
+print(f"Publications used    : {df_model[GROUP_COLUMN].nunique()}")
+
+if df_model[GROUP_COLUMN].nunique() < OUTER_FOLDS:
+    raise ValueError(
+        f"Publications are fewer than OUTER_FOLDS={OUTER_FOLDS}."
+    )
+
+
+# ============================================================
+# 10. MISSING-VALUE HANDLING
+# ============================================================
+
+# Fixed missing indicator/fill for IR compensation.
+df_model["IR compensation_missing"] = (
+    df_model["IR compensation"].isna().astype(int)
+)
+df_model["IR compensation"] = df_model["IR compensation"].fillna(-1)
+
+FEATURE_COLUMNS_MODEL = FEATURE_COLUMNS + ["IR compensation_missing"]
+
+# Missing category becomes an explicit category.
+for col in CATEGORICAL_FEATURES:
+    df_model[col] = (
+        df_model[col]
+        .astype("object")
+        .where(df_model[col].notna(), "__MISSING__")
+    )
+
+# No general numerical imputation.
+numerical_features_model = [
+    c for c in FEATURE_COLUMNS_MODEL if c not in CATEGORICAL_FEATURES
+]
+
+numerical_missing = df_model[numerical_features_model].isna().sum()
+numerical_missing = numerical_missing[numerical_missing > 0]
+
+if not numerical_missing.empty:
+    raise ValueError(
+        "Numerical features still contain missing values:\n" +
+        numerical_missing.to_string()
+    )
+
+
+# ============================================================
+# 11. X / y / GROUP / SAMPLE ID
+# ============================================================
+
+X = df_model[FEATURE_COLUMNS_MODEL].copy()
+y = df_model[TARGET_COLUMN].to_numpy(dtype=float)
+groups = df_model[GROUP_COLUMN].to_numpy()
+sample_ids = df_model[SAMPLE_COLUMN].to_numpy()
+
+print("\nFeature information:")
+print(f"Number of model features : {X.shape[1]}")
+print(f"Categorical features     : {CATEGORICAL_FEATURES}")
+print("Scaling                  : None (Random Forest)")
+
+
+# ============================================================
+# 12. OUTER GROUPKFOLD
+# ============================================================
+
+outer_cv = GroupKFold(n_splits=OUTER_FOLDS)
+outer_splits = list(outer_cv.split(X, y, groups=groups))
+
+fold_assignment = pd.DataFrame({
+    SAMPLE_COLUMN: sample_ids,
+    GROUP_COLUMN: groups,
+    "Outer_Fold": np.nan,
+})
+
+for outer_fold, (_, test_idx) in enumerate(outer_splits, start=1):
+    fold_assignment.loc[test_idx, "Outer_Fold"] = outer_fold
+
+if fold_assignment["Outer_Fold"].isna().any():
+    raise ValueError("Some samples were not assigned to an outer fold.")
+
+fold_assignment["Outer_Fold"] = fold_assignment["Outer_Fold"].astype(int)
+
+publication_fold_count = (
+    fold_assignment.groupby(GROUP_COLUMN)["Outer_Fold"].nunique()
+)
+
+if (publication_fold_count > 1).any():
+    raise ValueError("A publication was assigned to multiple outer test folds.")
+
+print("\nOuter publication grouping check: PASSED")
+
+
+# ============================================================
+# 13. NESTED GROUPED CROSS-VALIDATION
+# ============================================================
+
+outer_fold_metric_records = []
+oof_prediction_records = []
+all_inner_tuning_records = []
+best_param_records = []
+
+print("\n" + "=" * 70)
+print(f"RF NESTED GROUPED CV - {REPRESENTATION_NAME}")
+print("=" * 70)
+
+for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
+    print("\n" + "=" * 70)
+    print(f"OUTER FOLD {outer_fold}/{OUTER_FOLDS}")
+    print("=" * 70)
+
+    X_outer_train = X.iloc[train_idx].copy()
+    X_outer_test = X.iloc[test_idx].copy()
+    y_outer_train = y[train_idx]
+    y_outer_test = y[test_idx]
+    groups_outer_train = groups[train_idx]
+    groups_outer_test = groups[test_idx]
+
+    overlap = set(groups_outer_train) & set(groups_outer_test)
+    if overlap:
+        raise ValueError(
+            f"Outer Fold {outer_fold}: publication leakage detected: {overlap}"
+        )
+
+    print(f"Train samples       : {len(train_idx)}")
+    print(f"Test samples        : {len(test_idx)}")
+    print(f"Train publications  : {len(np.unique(groups_outer_train))}")
+    print(f"Test publications   : {len(np.unique(groups_outer_test))}")
+
+    # Inner 3-fold tuning, using only outer-train data.
+    best_value, tuning_df = tune_one_parameter_nested(
+        X_train=X_outer_train,
+        y_train=y_outer_train,
+        groups_train=groups_outer_train,
+        feature_columns=FEATURE_COLUMNS_MODEL,
+        outer_fold_label=outer_fold,
+    )
+
+    all_inner_tuning_records.append(tuning_df)
+    best_param_records.append({
+        "Outer_Fold": outer_fold,
+        "Parameter": UNIVARIATE_PARAM_NAME,
+        "Best_Value": best_value,
+    })
+
+    # Refit with selected hyperparameter on the complete outer-train set.
+    selected_params = BASE_PARAMS.copy()
+    selected_params[UNIVARIATE_PARAM_NAME] = best_value
+
+    outer_pipeline = build_pipeline(selected_params, FEATURE_COLUMNS_MODEL)
+    outer_pipeline.fit(X_outer_train, y_outer_train)
+
+    # Predict untouched outer-test fold.
+    y_outer_pred = outer_pipeline.predict(X_outer_test)
+    m = regression_metrics(y_outer_test, y_outer_pred)
+
+    outer_fold_metric_records.append({
+        "Outer_Fold": outer_fold,
+        "Best_Hyperparameter": best_value,
+        "MAE": m["MAE"],
+        "RMSE": m["RMSE"],
+        "R2": m["R2"],
+        "Train_Samples": len(train_idx),
+        "Test_Samples": len(test_idx),
+        "Train_Publications": len(np.unique(groups_outer_train)),
+        "Test_Publications": len(np.unique(groups_outer_test)),
+    })
+
+    print("\nOuter test result:")
+    print(f"Selected {UNIVARIATE_PARAM_NAME} = {best_value}")
+    print(f"MAE  = {m['MAE']:.4f}")
+    print(f"RMSE = {m['RMSE']:.4f}")
+    print(f"R2   = {m['R2']:.4f}")
+
+    for local_i, original_idx in enumerate(test_idx):
+        oof_prediction_records.append({
+            "Outer_Fold": outer_fold,
+            SAMPLE_COLUMN: sample_ids[original_idx],
+            GROUP_COLUMN: groups[original_idx],
+            "Actual": y_outer_test[local_i],
+            "Predicted": y_outer_pred[local_i],
+            "Best_Hyperparameter": best_value,
+        })
+
+
+# ============================================================
+# 14. COMBINE RESULTS
+# ============================================================
+
+outer_fold_metrics = pd.DataFrame(outer_fold_metric_records)
+oof_predictions = pd.DataFrame(oof_prediction_records)
+all_inner_tuning = pd.concat(all_inner_tuning_records, ignore_index=True)
+best_params_by_outer_fold = pd.DataFrame(best_param_records)
+
+
+# ============================================================
+# 15. OOF COMPLETENESS CHECK
+# ============================================================
+
+if oof_predictions[SAMPLE_COLUMN].duplicated().any():
+    raise ValueError("OOF predictions contain duplicated sample IDs.")
+
+expected_ids = set(sample_ids.tolist())
+observed_ids = set(oof_predictions[SAMPLE_COLUMN].tolist())
+
+if observed_ids != expected_ids:
+    raise ValueError("OOF predictions do not fully cover all model samples.")
+
+if (oof_predictions.groupby(GROUP_COLUMN)["Outer_Fold"].nunique() > 1).any():
+    raise ValueError("A publication appears in more than one OOF fold.")
+
+print("\nOOF completeness check: PASSED")
+
+
+# ============================================================
+# 16. OUTER-FOLD RESULTS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("OUTER FOLD METRICS")
+print("=" * 70)
+print(outer_fold_metrics.to_string(index=False))
+
+print("\nOuter-fold mean ± SD:")
+for metric in ["MAE", "RMSE", "R2"]:
+    mean_value = outer_fold_metrics[metric].mean()
+    sd_value = outer_fold_metrics[metric].std(ddof=1)
+    print(f"{metric:<4} = {mean_value:.4f} ± {sd_value:.4f}")
+
+
+# ============================================================
+# 17. BEST HYPERPARAMETER BY OUTER FOLD
+# ============================================================
+
+print("\n" + "=" * 70)
+print("BEST HYPERPARAMETER BY OUTER FOLD")
+print("=" * 70)
+print(best_params_by_outer_fold.to_string(index=False))
+
+
+# ============================================================
+# 18. POOLED OOF METRICS
+# ============================================================
+
+oof_actual = oof_predictions["Actual"].to_numpy()
+oof_predicted = oof_predictions["Predicted"].to_numpy()
+pooled_oof_metrics = regression_metrics(oof_actual, oof_predicted)
+
+print("\n" + "=" * 70)
+print("POOLED OOF PERFORMANCE")
+print("=" * 70)
+print(f"MAE  = {pooled_oof_metrics['MAE']:.4f}")
+print(f"RMSE = {pooled_oof_metrics['RMSE']:.4f}")
+print(f"R2   = {pooled_oof_metrics['R2']:.4f}")
+
+
+# ============================================================
+# 19. LITERATURE-LEVEL BOOTSTRAP 95% CI
+# ============================================================
+
+bootstrap_ci, bootstrap_distribution = literature_bootstrap_ci(
+    prediction_df=oof_predictions,
+    group_column=GROUP_COLUMN,
+    n_bootstrap=BOOTSTRAP_N,
+    ci=BOOTSTRAP_CI,
+    random_state=BOOTSTRAP_RANDOM_STATE,
+)
+
+print("\n" + "=" * 70)
+print(f"POOLED OOF + LITERATURE-LEVEL BOOTSTRAP {BOOTSTRAP_CI}% CI")
+print("=" * 70)
+
+for metric in ["MAE", "RMSE", "R2"]:
+    print_metric_with_ci(metric, pooled_oof_metrics[metric], bootstrap_ci)
+
+
+# ============================================================
+# 20. OPTIONAL |ACTUAL| <= 300 mV EVALUATION
+# ============================================================
+
+if EVAL_ABS_TARGET_MAX is not None:
+    subset_oof = oof_predictions[
+        np.abs(oof_predictions["Actual"]) <= EVAL_ABS_TARGET_MAX
+    ].copy()
+
+    print("\n" + "=" * 70)
+    print(f"OPTIONAL OOF EVALUATION: |Actual| <= {EVAL_ABS_TARGET_MAX}")
+    print("=" * 70)
+    print(f"Samples      : {len(subset_oof)} / {len(oof_predictions)}")
+    print(f"Publications : {subset_oof[GROUP_COLUMN].nunique()}")
+
+    if len(subset_oof) >= 2:
+        subset_metrics = regression_metrics(
+            subset_oof["Actual"].to_numpy(),
+            subset_oof["Predicted"].to_numpy(),
+        )
+        print(f"MAE  = {subset_metrics['MAE']:.4f}")
+        print(f"RMSE = {subset_metrics['RMSE']:.4f}")
+        print(f"R2   = {subset_metrics['R2']:.4f}")
+
+        if subset_oof[GROUP_COLUMN].nunique() >= 2:
+            subset_ci, _ = literature_bootstrap_ci(
+                prediction_df=subset_oof,
+                group_column=GROUP_COLUMN,
+                n_bootstrap=BOOTSTRAP_N,
+                ci=BOOTSTRAP_CI,
+                random_state=BOOTSTRAP_RANDOM_STATE,
+            )
+
+            print(f"\nBootstrap {BOOTSTRAP_CI}% CI:")
+            for metric in ["MAE", "RMSE", "R2"]:
+                print_metric_with_ci(metric, subset_metrics[metric], subset_ci)
+# ============================================================
+# 20-1. FULL-RANGE RMSE BY OUTER FOLD
+#       Export CSV for model ranking / statistical comparison
+# ============================================================
+
+MODEL_NAME = "RF"
+
+
+# ------------------------------------------------------------
+# Dataset name
+# ------------------------------------------------------------
+# 直接使用前面已經設定好的 DATASET_TYPE
+if DATASET_TYPE.upper() == "PA":
+    dataset_name = "PA"
+
+elif DATASET_TYPE.upper() == "RATIO":
+    dataset_name = "Ratio"
+
+else:
+    raise ValueError(
+        'DATASET_TYPE must be "PA" or "RATIO".'
+    )
+
+
+# ------------------------------------------------------------
+# Automatically identify target
+# ------------------------------------------------------------
+target_upper = TARGET_COLUMN.upper()
+
+if "OVERPOTENTIAL" in target_upper:
+    target_name = "OP"
+
+elif "TAFEL" in target_upper:
+    target_name = "Tafel"
+
+else:
+    target_name = TARGET_COLUMN
+
+
+# ------------------------------------------------------------
+# Full Range setting
+# ------------------------------------------------------------
+range_name = "Full Range"
+
+
+# ------------------------------------------------------------
+# Calculate Full Range RMSE for each Outer Fold
+# ------------------------------------------------------------
+full_fold_records = []
+
+for fold in range(1, OUTER_FOLDS + 1):
+
+    # Get all OOF predictions belonging to this Outer Fold
+    # 不進行任何 target 範圍篩選
+    fold_df = oof_predictions.loc[
+        oof_predictions["Outer_Fold"] == fold
+    ].copy()
+
+    # Calculate Full Range RMSE
+    if len(fold_df) == 0:
+        fold_rmse = np.nan
+
+    else:
+        fold_rmse = np.sqrt(
+            mean_squared_error(
+                fold_df["Actual"],
+                fold_df["Predicted"]
+            )
+        )
+
+    full_fold_records.append({
+        "Model": MODEL_NAME,
+        "Dataset": dataset_name,
+        "Target": target_name,
+        "Range": range_name,
+        "Outer_Fold": fold,
+        "N_Samples": len(fold_df),
+        "RMSE": fold_rmse
+    })
+
+
+# ------------------------------------------------------------
+# Convert to DataFrame
+# ------------------------------------------------------------
+full_fold_rmse_df = pd.DataFrame(
+    full_fold_records
+)
+
+
+# ------------------------------------------------------------
+# Display results
+# ------------------------------------------------------------
+print("\n" + "=" * 78)
+print("FULL-RANGE RMSE BY OUTER FOLD")
+print("=" * 78)
+
+print(
+    full_fold_rmse_df.to_string(
+        index=False
+    )
+)
+
+
+# ------------------------------------------------------------
+# Automatically generate output filename
+# ------------------------------------------------------------
+range_file_name = range_name.replace(" ", "_")
+
+OUTPUT_FILE = (
+    f"{MODEL_NAME}_"
+    f"{dataset_name}_"
+    f"{target_name}_"
+    f"{range_file_name}_"
+    f"outer_fold_RMSE.csv"
+)
+
+
+# ------------------------------------------------------------
+# Export CSV
+# ------------------------------------------------------------
+full_fold_rmse_df.to_csv(
+    OUTPUT_FILE,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print(f"\nSaved as: {OUTPUT_FILE}")
+
+# ============================================================
+# 21. OOF ACTUAL VS PREDICTED
+# ============================================================
+
+plt.figure(figsize=(5, 5))
+plt.scatter(oof_actual, oof_predicted, alpha=0.7)
+
+plot_min = min(np.min(oof_actual), np.min(oof_predicted))
+plot_max = max(np.max(oof_actual), np.max(oof_predicted))
+
+plt.plot([plot_min, plot_max], [plot_min, plot_max], "r--")
+plt.xlabel("Actual Overpotential (mV)")
+plt.ylabel("Predicted Overpotential (mV)")
+plt.title(
+    f"RF - Pooled OOF Predictions (P/A)"
+)
+plt.grid(True)
+plt.subplots_adjust(left=0.16, right=0.96, bottom=0.13, top=0.88)
+plt.show()
+
+
+# ============================================================
+# 22. INNER-TUNING CURVE
+# ============================================================
+
+plt.figure(figsize=(7, 5))
+
+for outer_fold in sorted(all_inner_tuning["Outer_Fold"].unique()):
+    one_fold = all_inner_tuning[
+        all_inner_tuning["Outer_Fold"] == outer_fold
+    ].copy()
+
+    if TUNING_METRIC.upper() == "RMSE":
+        y_values = one_fold["Mean_RMSE"].to_numpy()
+        y_errors = one_fold["SD_RMSE"].to_numpy()
+        ylabel = "Inner Validation RMSE"
+    elif TUNING_METRIC.upper() == "MAE":
+        y_values = one_fold["Mean_MAE"].to_numpy()
+        y_errors = one_fold["SD_MAE"].to_numpy()
+        ylabel = "Inner Validation MAE"
+    else:
+        y_values = one_fold["Mean_R2"].to_numpy()
+        y_errors = one_fold["SD_R2"].to_numpy()
+        ylabel = "Inner Validation R²"
+
+    x_pos = np.arange(len(one_fold))
+    plt.errorbar(
+        x_pos,
+        y_values,
+        yerr=y_errors,
+        marker="o",
+        capsize=3,
+        label=f"Outer Fold {outer_fold}",
+    )
+
+plt.xticks(
+    np.arange(len(UNIVARIATE_PARAM_VALUES)),
+    [str(v) for v in UNIVARIATE_PARAM_VALUES]
+)
+plt.xlabel(UNIVARIATE_PARAM_NAME)
+plt.ylabel(ylabel)
+plt.title(f"RF Inner-CV Univariate Tuning\n{REPRESENTATION_NAME}")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 23. FINAL FULL-DATA GROUPED TUNING
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL FULL-DATA GROUPED HYPERPARAMETER SELECTION")
+print("=" * 70)
+
+final_best_value, final_tuning_df = tune_one_parameter_nested(
+    X_train=X,
+    y_train=y,
+    groups_train=groups,
+    feature_columns=FEATURE_COLUMNS_MODEL,
+    outer_fold_label="FINAL_FULL_DATA",
+)
+
+print("\nSelected final-model hyperparameter:")
+print(f"{UNIVARIATE_PARAM_NAME} = {final_best_value}")
+
+
+# ============================================================
+# 24. FIT FINAL MODEL ON 100% DATA
+# ============================================================
+
+final_params = BASE_PARAMS.copy()
+final_params[UNIVARIATE_PARAM_NAME] = final_best_value
+
+final_pipeline = build_pipeline(final_params, FEATURE_COLUMNS_MODEL)
+final_pipeline.fit(X, y)
+
+print("\nFinal model fitted on 100% of available data.")
+print(f"Final {UNIVARIATE_PARAM_NAME} = {final_best_value}")
+
+
+# ============================================================
+# 25. SHAP ANALYSIS
+# ============================================================
+
+if RUN_FINAL_SHAP:
+    print("\n" + "=" * 70)
+    print("FINAL RANDOM FOREST SHAP ANALYSIS")
+    print("=" * 70)
+
+    final_preprocessor = final_pipeline.named_steps["preprocessor"]
+    final_rf = final_pipeline.named_steps["rf"]
+
+    X_transformed = final_preprocessor.transform(X)
+    if hasattr(X_transformed, "toarray"):
+        X_transformed = X_transformed.toarray()
+    X_transformed = np.asarray(X_transformed, dtype=float)
+
+    transformed_feature_names = (
+        final_preprocessor.get_feature_names_out().tolist()
+    )
+
+    rng = np.random.default_rng(SHAP_RANDOM_STATE)
+
+    if SHAP_EXPLAIN_SIZE is None:
+        explain_idx = np.arange(len(X_transformed))
+    else:
+        n_explain = min(SHAP_EXPLAIN_SIZE, len(X_transformed))
+        explain_idx = np.sort(
+            rng.choice(len(X_transformed), size=n_explain, replace=False)
+        )
+
+    X_explain = X_transformed[explain_idx]
+
+    explainer = shap.TreeExplainer(final_rf)
+    shap_values = np.asarray(explainer.shap_values(X_explain))
+    expected_value = float(
+        np.asarray(explainer.expected_value).reshape(-1)[0]
+    )
+
+    shap_keep_idx = [
+        i for i, name in enumerate(transformed_feature_names)
+        if name != "IR compensation_missing"
+    ]
+
+    explanation = shap.Explanation(
+        values=shap_values[:, shap_keep_idx],
+        base_values=np.repeat(expected_value, len(X_explain)),
+        data=X_explain[:, shap_keep_idx],
+        feature_names=[
+            transformed_feature_names[i] for i in shap_keep_idx
+        ],
+    )
+
+    print(f"Training samples  : {len(X_transformed)}")
+    print(f"Explained samples : {len(X_explain)}")
+    print(f"Features          : {len(shap_keep_idx)}")
+
+    # SHAP Feature Importance
+    plt.figure(figsize=(6, 5))
+    shap.plots.bar(
+        explanation,
+        max_display=SHAP_MAX_DISPLAY,
+        show=False
+    )
+
+    fig = plt.gcf()
+    ax = plt.gca()
+
+    for patch in ax.patches:
+        patch.set_facecolor(SHAP_BAR_COLOR)
+        patch.set_edgecolor(SHAP_BAR_COLOR)
+
+    ax.set_xlabel("mean(|SHAP value|)")
+    ax.set_title(
+        f"Overpotential - SHAP Feature Importance\nRF ({REPRESENTATION_NAME})",
+        fontsize=12
+    )
+    fig.set_size_inches(6, 5)
+    fig.subplots_adjust(left=0.32, right=0.96, bottom=0.13, top=0.88)
+    plt.show()
+
+    # SHAP Beeswarm
+    plt.figure(figsize=(7, 5))
+    shap.plots.beeswarm(
+        explanation,
+        max_display=SHAP_MAX_DISPLAY,
+        color=SHAP_CMAP,
+        show=False
+    )
+
+    fig = plt.gcf()
+    ax = plt.gca()
+    ax.set_xlabel("SHAP value (impact on model output)")
+    ax.set_title(
+        f"Overpotential - SHAP Summary\nRF ({REPRESENTATION_NAME})",
+        fontsize=12
+    )
+    fig.set_size_inches(7, 5)
+    fig.subplots_adjust(left=0.32, right=0.90, bottom=0.13, top=0.88)
+    plt.show()
+
+
+# ============================================================
+# 26. FINAL SUMMARY
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL SUMMARY")
+print("=" * 70)
+print(f"Representation : {REPRESENTATION_NAME}")
+print(f"Dataset        : {FILE_PATH}")
+print(f"Nested CV      : Outer {OUTER_FOLDS}-fold / Inner {INNER_FOLDS}-fold")
+print(f"Grouping       : {GROUP_COLUMN}")
+print(f"Tuned param    : {UNIVARIATE_PARAM_NAME}")
+print(f"Final value    : {final_best_value}")
+
+print("\nPooled OOF:")
+print(f"MAE  = {pooled_oof_metrics['MAE']:.4f}")
+print(f"RMSE = {pooled_oof_metrics['RMSE']:.4f}")
+print(f"R2   = {pooled_oof_metrics['R2']:.4f}")
+
+print("\nDone.")
 
