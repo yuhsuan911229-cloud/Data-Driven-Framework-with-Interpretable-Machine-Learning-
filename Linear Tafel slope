@@ -1,1 +1,1287 @@
+# ============================================================
+# Linear Regression - P/A dataset
+# Nested Grouped Cross-Validation
+# Outer 5-fold + Inner 3-fold
+# Literature-grouped splitting + univariate tuning
+# Pooled OOF evaluation + literature-level bootstrap 95% CI
+# ============================================================
 
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+
+from matplotlib.colors import LinearSegmentedColormap
+
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import OrdinalEncoder, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+
+# ============================================================
+# 1. 基本設定：通常只需要先改這一區
+# ============================================================
+
+FILE_PATH = "Ratio.csv"
+SHEET_NAME = None
+
+TARGET_COLUMN = "Tafel slope"       # 目標欄位
+GROUP_COLUMN = "Reference"          # 文獻 ID
+SAMPLE_COLUMN = "Index"             # 每筆資料的識別欄位
+
+OUTER_FOLDS = 5
+INNER_FOLDS = 3
+RANDOM_STATE = 42
+
+# ------------------------------------------------------------
+# 自動判斷資料集名稱（供 SHAP 圖表標題使用）
+# ------------------------------------------------------------
+file_name_upper = FILE_PATH.upper()
+
+if "P_A" in file_name_upper or "PA" in file_name_upper:
+    REPRESENTATION_NAME = "P/A"
+
+elif "RATIO" in file_name_upper:
+    REPRESENTATION_NAME = "Ratio"
+
+else:
+    REPRESENTATION_NAME = "Unknown"
+
+
+# ------------------------------------------------------------
+# Bootstrap 設定
+# ------------------------------------------------------------
+BOOTSTRAP_N = 2000
+BOOTSTRAP_CI = 95
+BOOTSTRAP_RANDOM_STATE = 42
+
+
+# ------------------------------------------------------------
+# 是否額外評估限定區間
+# ------------------------------------------------------------
+# 此設定只控制額外的 Restricted Range 評估。
+# 前面修改的 Full Range CSV 輸出不受此設定影響。
+
+EVAL_ABS_TARGET_MAX = 150.0
+
+# ============================================================
+# 2. Linear Regression 設定
+#
+# LinearRegression 本身沒有像 SVR 的 C / gamma、RF 的 max_depth
+# 這類需要搜尋的核心複雜度超參數。
+#
+# 因此這裡不進行不必要的 inner-CV 超參數搜尋；
+# 但保留 Outer 5-fold literature-grouped CV、pooled OOF、
+# literature-level bootstrap 95% CI、final full-data model 與 SHAP。
+# ============================================================
+
+BASE_PARAMS = {
+    "fit_intercept": True
+}
+
+# Linear Regression 無需單變量超參數搜尋
+UNIVARIATE_PARAM_NAME = "None"
+UNIVARIATE_PARAM_VALUES = [None]
+
+TUNING_METRIC = "RMSE"
+PRINT_INNER_DETAILS = False
+
+# Final-model + SHAP settings
+RUN_FINAL_SHAP = True
+SHAP_RANDOM_STATE = 42
+SHAP_BACKGROUND_SIZE = 30
+SHAP_EXPLAIN_SIZE = None       # None = 解釋全部樣本
+SHAP_NSAMPLES = 300
+SHAP_MAX_DISPLAY = 11
+
+SHAP_BAR_COLOR = "#FF0051"
+SHAP_CMAP = LinearSegmentedColormap.from_list(
+    "shap_blue_red", ["#008BFB", "#8B00FF", "#FF0051"]
+)
+
+
+# ============================================================
+# 3. P/A 模型使用的特徵
+#
+# 這裡沿用你原本 P/A / Ratio 原始比較程式中的核心特徵，
+# 不額外加入 Power、Base pressure、Gas、Working pressure。
+# ============================================================
+
+FEATURE_COLUMNS = [
+    "Substrate",
+    "Temperature",
+    "Ni", "Mo", "Co", "Fe", "Cu", "Al", "Pt", "NiO", "V", "W",
+    "N", "Pd", "S", "Cr", "Ni(OH)2", "Ag", "C", "Zr", "Ru", "Nb",
+    "Electrolyte",
+    "Concentration",
+    "IR compensation"
+]
+
+CATEGORICAL_FEATURES = ["Substrate", "Electrolyte"]
+
+
+# ============================================================
+# 4. 評估函數
+# ============================================================
+
+def regression_metrics(y_true, y_pred):
+    """計算 MAE / RMSE / R2。"""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+    # R2 至少需要兩筆資料；若 target 完全相同也可能沒有意義
+    if len(y_true) >= 2:
+        r2 = r2_score(y_true, y_pred)
+    else:
+        r2 = np.nan
+
+    return {
+        "MAE": mae,
+        "RMSE": rmse,
+        "R2": r2
+    }
+
+
+def is_better_score(new_score, best_score, metric_name):
+    """判斷新的 inner-CV 分數是否優於目前最佳分數。"""
+    if best_score is None:
+        return True
+
+    metric_name = metric_name.upper()
+
+    if metric_name in ["RMSE", "MAE"]:
+        return new_score < best_score
+    elif metric_name == "R2":
+        return new_score > best_score
+    else:
+        raise ValueError("TUNING_METRIC 只能是 'RMSE', 'MAE', 'R2'。")
+
+
+# ============================================================
+# 5. 建立 preprocessing + Linear Regression Pipeline
+#
+# 重要：
+# OrdinalEncoder 與 MinMaxScaler 都放在 Pipeline 裡，
+# 因此每次 CV 都只會在當下 training fold 上 fit，避免 leakage。
+# ============================================================
+
+def build_pipeline(feature_columns, categorical_features, model_params):
+    numerical_features = [
+        col for col in feature_columns
+        if col not in categorical_features
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                MinMaxScaler(),
+                numerical_features
+            ),
+            (
+                "cat",
+                OrdinalEncoder(
+                    handle_unknown="use_encoded_value",
+                    unknown_value=-1
+                ),
+                categorical_features
+            )
+        ],
+        remainder="drop"
+    )
+
+    model = LinearRegression(**model_params)
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocess", preprocessor),
+            ("model", model)
+        ]
+    )
+
+    return pipeline
+
+
+# ============================================================
+# 6. Linear Regression：保留 nested workflow 介面（無超參數搜尋）
+# ============================================================
+
+def tune_one_parameter_nested(
+    X_outer_train,
+    y_outer_train,
+    groups_outer_train,
+    feature_columns,
+    categorical_features,
+    outer_fold_number
+):
+    """
+    Linear Regression 無需超參數搜尋。
+
+    為了保留原本 nested workflow 的資料結構與後續輸出介面，
+    這裡直接回傳固定 LinearRegression 設定。
+    Outer Test 不會參與任何模型選擇。
+    """
+    best_params = BASE_PARAMS.copy()
+    best_value = "Not applicable"
+    best_score = np.nan
+
+    candidate_df = pd.DataFrame([{
+        "Outer_Fold": outer_fold_number,
+        "Parameter": "None",
+        "Candidate_Value": "Not applicable",
+        "Inner_MAE_Mean": np.nan,
+        "Inner_MAE_SD": np.nan,
+        "Inner_RMSE_Mean": np.nan,
+        "Inner_RMSE_SD": np.nan,
+        "Inner_R2_Mean": np.nan,
+        "Inner_R2_SD": np.nan
+    }])
+
+    if PRINT_INNER_DETAILS:
+        print("\n  Linear Regression: no hyperparameter tuning required.")
+
+    return best_params, best_value, best_score, candidate_df
+
+
+# ============================================================
+# 7. Literature-level / Cluster Bootstrap 95% CI
+#
+# Bootstrap 的抽樣單位是 Reference，而不是單筆 row。
+# 若某篇文獻被抽到兩次，該文獻的所有 rows 也會被放入兩次。
+# ============================================================
+
+def literature_bootstrap_ci(
+    prediction_df,
+    group_column,
+    actual_column="Actual",
+    predicted_column="Predicted",
+    n_bootstrap=2000,
+    ci=95,
+    random_state=42
+):
+    rng = np.random.default_rng(random_state)
+
+    unique_groups = prediction_df[group_column].dropna().unique()
+    n_groups = len(unique_groups)
+
+    if n_groups < 2:
+        raise ValueError("Bootstrap 至少需要 2 個 literature groups。")
+
+    bootstrap_mae = []
+    bootstrap_rmse = []
+    bootstrap_r2 = []
+
+    # 先建立 group -> row DataFrame，避免每次重複搜尋
+    group_frames = {
+        g: prediction_df.loc[prediction_df[group_column] == g].copy()
+        for g in unique_groups
+    }
+
+    for _ in range(n_bootstrap):
+        sampled_groups = rng.choice(
+            unique_groups,
+            size=n_groups,
+            replace=True
+        )
+
+        sampled_frames = [group_frames[g] for g in sampled_groups]
+        boot_df = pd.concat(sampled_frames, ignore_index=True)
+
+        y_true_boot = boot_df[actual_column].to_numpy(dtype=float)
+        y_pred_boot = boot_df[predicted_column].to_numpy(dtype=float)
+
+        metrics = regression_metrics(y_true_boot, y_pred_boot)
+
+        bootstrap_mae.append(metrics["MAE"])
+        bootstrap_rmse.append(metrics["RMSE"])
+
+        if np.isfinite(metrics["R2"]):
+            bootstrap_r2.append(metrics["R2"])
+
+    alpha = (100 - ci) / 2
+    lower_q = alpha
+    upper_q = 100 - alpha
+
+    def percentile_ci(values):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return (np.nan, np.nan)
+
+        return (
+            np.percentile(values, lower_q),
+            np.percentile(values, upper_q)
+        )
+
+    return {
+        "MAE": percentile_ci(bootstrap_mae),
+        "RMSE": percentile_ci(bootstrap_rmse),
+        "R2": percentile_ci(bootstrap_r2)
+    }
+
+
+# ============================================================
+# 8. 讀取資料
+# ============================================================
+
+print("=" * 78)
+print("Linear Regression - Nested Grouped Cross-Validation")
+print("=" * 78)
+
+if FILE_PATH.lower().endswith((".xlsx", ".xls")):
+    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_NAME)
+else:
+    df = pd.read_csv(FILE_PATH)
+
+print(f"Original samples      : {len(df)}")
+print(f"Original publications : {df[GROUP_COLUMN].nunique()}")
+
+
+# ============================================================
+# 9. 欄位完整性檢查
+# ============================================================
+
+required_columns = (
+    [GROUP_COLUMN, SAMPLE_COLUMN, TARGET_COLUMN]
+    + FEATURE_COLUMNS
+)
+
+missing_columns = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        "以下必要欄位不存在：\n" + "\n".join(missing_columns)
+    )
+
+if df[GROUP_COLUMN].isna().any():
+    raise ValueError(
+        f"{GROUP_COLUMN} 存在缺失值，無法進行 literature-grouped CV。"
+    )
+
+
+# ============================================================
+# 10. 移除 target 缺失資料
+# ============================================================
+
+df_model = (
+    df.dropna(subset=[TARGET_COLUMN])
+      .copy()
+      .reset_index(drop=True)
+)
+
+print("\nAfter removing missing target:")
+print(f"Samples used          : {len(df_model)}")
+print(f"Publications used     : {df_model[GROUP_COLUMN].nunique()}")
+print(f"Removed target-NA rows: {len(df) - len(df_model)}")
+
+if df_model[GROUP_COLUMN].nunique() < OUTER_FOLDS:
+    raise ValueError(
+        f"Publication 數量少於 OUTER_FOLDS={OUTER_FOLDS}。"
+    )
+
+
+# ============================================================
+# 11. IR compensation 缺失處理
+#
+# 缺失 indicator 與固定填值 -1 不需要從資料估計參數，
+# 因此可安全地在 CV 前建立。
+# ============================================================
+
+df_model["IR compensation_missing"] = (
+    df_model["IR compensation"].isna().astype(int)
+)
+
+df_model["IR compensation"] = (
+    df_model["IR compensation"].fillna(-1)
+)
+
+FEATURE_COLUMNS_MODEL = FEATURE_COLUMNS + ["IR compensation_missing"]
+
+
+# ============================================================
+# 12. 類別欄位固定缺失字串
+#
+# 這只是固定標記，不從全資料學習任何統計量。
+# 真正的 OrdinalEncoder 仍在每個 CV training fold 內 fit。
+# ============================================================
+
+for col in CATEGORICAL_FEATURES:
+    df_model[col] = df_model[col].fillna("__MISSING__").astype(str)
+
+
+# ============================================================
+# 13. 一般數值欄位缺失檢查
+#
+# 沿用原始資料處理思路：除了 IR compensation 外，
+# 不主動做 general numerical imputation。
+# ============================================================
+
+NUMERICAL_FEATURES = [
+    col for col in FEATURE_COLUMNS_MODEL
+    if col not in CATEGORICAL_FEATURES
+]
+
+missing_numeric = df_model[NUMERICAL_FEATURES].isna().sum()
+missing_numeric = missing_numeric[missing_numeric > 0]
+
+if not missing_numeric.empty:
+    raise ValueError(
+        "以下 numerical features 存在缺失值。\n"
+        "目前程式依原始資料處理設定不進行一般性 imputation：\n"
+        + missing_numeric.to_string()
+    )
+
+
+# ============================================================
+# 14. 建立 X / y / groups / sample ID
+# ============================================================
+
+X = df_model[FEATURE_COLUMNS_MODEL].copy()
+y = df_model[TARGET_COLUMN].to_numpy(dtype=float)
+groups = df_model[GROUP_COLUMN].to_numpy()
+sample_ids = df_model[SAMPLE_COLUMN].to_numpy()
+
+print("\nModel setup:")
+print(f"Feature count         : {X.shape[1]}")
+print(f"Categorical features  : {CATEGORICAL_FEATURES}")
+print(f"Outer folds           : {OUTER_FOLDS}")
+print(f"Inner folds           : {INNER_FOLDS}")
+print(f"Grouping column       : {GROUP_COLUMN}")
+print("Tuning parameter      : None (Linear Regression)")
+print("Candidate values      : Not applicable")
+print(f"Tuning metric         : {TUNING_METRIC}")
+
+
+# ============================================================
+# 15. Outer 5-fold Grouped CV
+# ============================================================
+
+outer_cv = GroupKFold(n_splits=OUTER_FOLDS)
+outer_splits = list(
+    outer_cv.split(X, y, groups=groups)
+)
+
+# 儲存所有 OOF prediction
+prediction_records = []
+
+# 儲存 outer fold metrics
+outer_metric_records = []
+
+# 儲存每個 outer fold 的最佳參數
+best_param_records = []
+
+# 儲存所有 inner tuning curves
+all_inner_tuning_records = []
+
+# 儲存 fold assignment
+fold_assignment = pd.DataFrame({
+    SAMPLE_COLUMN: sample_ids,
+    GROUP_COLUMN: groups,
+    "Outer_Fold": np.nan
+})
+
+
+for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(
+    outer_splits,
+    start=1
+):
+    print("\n" + "=" * 78)
+    print(f"OUTER FOLD {outer_fold} / {OUTER_FOLDS}")
+    print("=" * 78)
+
+    X_outer_train = X.iloc[outer_train_idx].copy()
+    X_outer_test = X.iloc[outer_test_idx].copy()
+
+    y_outer_train = y[outer_train_idx]
+    y_outer_test = y[outer_test_idx]
+
+    groups_outer_train = groups[outer_train_idx]
+    groups_outer_test = groups[outer_test_idx]
+
+    # --------------------------------------------------------
+    # Outer literature leakage check
+    # --------------------------------------------------------
+    outer_overlap = set(groups_outer_train) & set(groups_outer_test)
+
+    if outer_overlap:
+        raise ValueError(
+            f"Outer Fold {outer_fold}: publication leakage detected: "
+            f"{outer_overlap}"
+        )
+
+    print(f"Outer train samples       : {len(outer_train_idx)}")
+    print(f"Outer test samples        : {len(outer_test_idx)}")
+    print(f"Outer train publications  : {len(set(groups_outer_train))}")
+    print(f"Outer test publications   : {len(set(groups_outer_test))}")
+    print("Publication overlap       : 0")
+
+    # --------------------------------------------------------
+    # Inner 3-fold Grouped CV + 單變量調參
+    # --------------------------------------------------------
+    best_params, best_value, best_inner_score, tuning_df = (
+        tune_one_parameter_nested(
+            X_outer_train=X_outer_train,
+            y_outer_train=y_outer_train,
+            groups_outer_train=groups_outer_train,
+            feature_columns=FEATURE_COLUMNS_MODEL,
+            categorical_features=CATEGORICAL_FEATURES,
+            outer_fold_number=outer_fold
+        )
+    )
+
+    all_inner_tuning_records.append(tuning_df)
+
+    print("\n  Model setting")
+    print("  " + "-" * 66)
+    print("  Linear Regression uses fixed ordinary least-squares settings.")
+
+    # --------------------------------------------------------
+    # 使用最佳參數，在完整 Outer Train 重新 fit
+    # --------------------------------------------------------
+    final_outer_pipeline = build_pipeline(
+        FEATURE_COLUMNS_MODEL,
+        CATEGORICAL_FEATURES,
+        best_params
+    )
+
+    final_outer_pipeline.fit(X_outer_train, y_outer_train)
+
+    # --------------------------------------------------------
+    # 預測從未參與 inner tuning 的 Outer Test
+    # --------------------------------------------------------
+    y_outer_pred = final_outer_pipeline.predict(X_outer_test)
+
+    outer_metrics = regression_metrics(
+        y_outer_test,
+        y_outer_pred
+    )
+
+    print("\n  Outer test performance")
+    print("  " + "-" * 66)
+    print(f"  MAE  = {outer_metrics['MAE']:.4f}")
+    print(f"  RMSE = {outer_metrics['RMSE']:.4f}")
+    print(f"  R²   = {outer_metrics['R2']:.4f}")
+
+    # --------------------------------------------------------
+    # 儲存 outer fold metric
+    # --------------------------------------------------------
+    outer_metric_records.append({
+        "Outer_Fold": outer_fold,
+        "Train_Samples": len(outer_train_idx),
+        "Test_Samples": len(outer_test_idx),
+        "Train_Publications": len(set(groups_outer_train)),
+        "Test_Publications": len(set(groups_outer_test)),
+        "MAE": outer_metrics["MAE"],
+        "RMSE": outer_metrics["RMSE"],
+        "R2": outer_metrics["R2"]
+    })
+
+    # --------------------------------------------------------
+    # 儲存最佳參數
+    # --------------------------------------------------------
+    best_param_records.append({
+        "Outer_Fold": outer_fold,
+        "Tuned_Parameter": "None",
+        "Best_Value": "Not applicable",
+        f"Best_Inner_{TUNING_METRIC}": np.nan
+    })
+
+    # --------------------------------------------------------
+    # 儲存 OOF predictions
+    # --------------------------------------------------------
+    for local_i, original_idx in enumerate(outer_test_idx):
+        prediction_records.append({
+            "Outer_Fold": outer_fold,
+            SAMPLE_COLUMN: sample_ids[original_idx],
+            GROUP_COLUMN: groups[original_idx],
+            "Actual": y_outer_test[local_i],
+            "Predicted": y_outer_pred[local_i],
+            "Residual": y_outer_test[local_i] - y_outer_pred[local_i],
+            "Absolute_Error": abs(y_outer_test[local_i] - y_outer_pred[local_i])
+        })
+
+    # Fold assignment
+    fold_assignment.loc[outer_test_idx, "Outer_Fold"] = outer_fold
+
+
+# ============================================================
+# 16. 整理 Nested CV 結果
+# ============================================================
+
+outer_metrics_df = pd.DataFrame(outer_metric_records)
+best_params_df = pd.DataFrame(best_param_records)
+oof_predictions = pd.DataFrame(prediction_records)
+inner_tuning_df = pd.concat(
+    all_inner_tuning_records,
+    ignore_index=True
+)
+
+fold_assignment["Outer_Fold"] = (
+    fold_assignment["Outer_Fold"].astype(int)
+)
+
+
+# ============================================================
+# 17. OOF 完整性與 literature grouping 檢查
+# ============================================================
+
+if len(oof_predictions) != len(df_model):
+    raise ValueError(
+        "OOF prediction 數量不等於模型資料筆數。"
+    )
+
+# 用 model-row index 概念檢查：每個 sample ID 應只出現一次。
+# 如果你的 Index 在不同文獻間可能重複，可改成 Reference + Index 聯合檢查。
+if oof_predictions.duplicated(
+    subset=[GROUP_COLUMN, SAMPLE_COLUMN]
+).any():
+    duplicated_rows = oof_predictions.loc[
+        oof_predictions.duplicated(
+            subset=[GROUP_COLUMN, SAMPLE_COLUMN],
+            keep=False
+        ),
+        [GROUP_COLUMN, SAMPLE_COLUMN]
+    ]
+
+    raise ValueError(
+        "OOF prediction 中出現重複的 Reference + Index：\n"
+        + duplicated_rows.to_string(index=False)
+    )
+
+publication_fold_count = (
+    fold_assignment
+    .groupby(GROUP_COLUMN)["Outer_Fold"]
+    .nunique()
+)
+
+if (publication_fold_count > 1).any():
+    raise ValueError(
+        "有 publication 被分配到多個 outer test folds。"
+    )
+
+print("\n" + "=" * 78)
+print("OOF / GROUPING CHECK")
+print("=" * 78)
+print(f"Complete OOF coverage  : {len(oof_predictions) == len(df_model)}")
+print("Publication grouping   : PASSED")
+print("Outer leakage check    : PASSED")
+print("Inner leakage check    : PASSED")
+
+
+# ============================================================
+# 18. Outer-fold Mean ± SD
+#
+# 這是每折 test performance 的穩定性描述，
+# 不是主要 pooled OOF point estimate。
+# ============================================================
+
+print("\n" + "=" * 78)
+print("OUTER-FOLD PERFORMANCE")
+print("=" * 78)
+print(
+    outer_metrics_df[
+        ["Outer_Fold", "MAE", "RMSE", "R2"]
+    ].to_string(index=False)
+)
+
+print("\nMean ± SD across outer folds")
+print(
+    f"MAE  = {outer_metrics_df['MAE'].mean():.4f} "
+    f"± {outer_metrics_df['MAE'].std(ddof=1):.4f}"
+)
+print(
+    f"RMSE = {outer_metrics_df['RMSE'].mean():.4f} "
+    f"± {outer_metrics_df['RMSE'].std(ddof=1):.4f}"
+)
+print(
+    f"R²   = {outer_metrics_df['R2'].mean():.4f} "
+    f"± {outer_metrics_df['R2'].std(ddof=1):.4f}"
+)
+
+
+# ============================================================
+# 19. Pooled OOF evaluation
+#
+# 將 5 個 outer test folds 的 prediction 合併後，
+# 一次計算整體 MAE / RMSE / R2。
+# ============================================================
+
+y_oof_true = oof_predictions["Actual"].to_numpy(dtype=float)
+y_oof_pred = oof_predictions["Predicted"].to_numpy(dtype=float)
+
+pooled_metrics = regression_metrics(
+    y_oof_true,
+    y_oof_pred
+)
+
+print("\n" + "=" * 78)
+print("POOLED OOF PERFORMANCE")
+print("=" * 78)
+print(f"OOF samples = {len(oof_predictions)}")
+print(f"MAE         = {pooled_metrics['MAE']:.4f}")
+print(f"RMSE        = {pooled_metrics['RMSE']:.4f}")
+print(f"R²          = {pooled_metrics['R2']:.4f}")
+
+
+# ============================================================
+# 20. Literature-level Bootstrap 95% CI
+# ============================================================
+
+bootstrap_ci = literature_bootstrap_ci(
+    prediction_df=oof_predictions,
+    group_column=GROUP_COLUMN,
+    actual_column="Actual",
+    predicted_column="Predicted",
+    n_bootstrap=BOOTSTRAP_N,
+    ci=BOOTSTRAP_CI,
+    random_state=BOOTSTRAP_RANDOM_STATE
+)
+
+print("\n" + "=" * 78)
+print(f"POOLED OOF + LITERATURE-LEVEL BOOTSTRAP {BOOTSTRAP_CI}% CI")
+print("=" * 78)
+
+print(
+    f"MAE  = {pooled_metrics['MAE']:.4f} "
+    f"[{BOOTSTRAP_CI}% CI: "
+    f"{bootstrap_ci['MAE'][0]:.4f}, {bootstrap_ci['MAE'][1]:.4f}]"
+)
+
+print(
+    f"RMSE = {pooled_metrics['RMSE']:.4f} "
+    f"[{BOOTSTRAP_CI}% CI: "
+    f"{bootstrap_ci['RMSE'][0]:.4f}, {bootstrap_ci['RMSE'][1]:.4f}]"
+)
+
+print(
+    f"R²   = {pooled_metrics['R2']:.4f} "
+    f"[{BOOTSTRAP_CI}% CI: "
+    f"{bootstrap_ci['R2'][0]:.4f}, {bootstrap_ci['R2'][1]:.4f}]"
+)
+
+
+# ============================================================
+# 21. 可選：只評估 |Actual target| <= 指定範圍
+#
+# 例如 -250 mV -> |eta| = 250 mV。
+# ============================================================
+
+if EVAL_ABS_TARGET_MAX is not None:
+    range_mask = (
+        np.abs(oof_predictions["Actual"].to_numpy(dtype=float))
+        <= EVAL_ABS_TARGET_MAX
+    )
+
+    oof_range = (
+        oof_predictions.loc[range_mask]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    if len(oof_range) >= 2:
+        range_metrics = regression_metrics(
+            oof_range["Actual"].to_numpy(dtype=float),
+            oof_range["Predicted"].to_numpy(dtype=float)
+        )
+
+        range_bootstrap_ci = literature_bootstrap_ci(
+            prediction_df=oof_range,
+            group_column=GROUP_COLUMN,
+            actual_column="Actual",
+            predicted_column="Predicted",
+            n_bootstrap=BOOTSTRAP_N,
+            ci=BOOTSTRAP_CI,
+            random_state=BOOTSTRAP_RANDOM_STATE
+        )
+
+        print("\n" + "=" * 78)
+        print(
+            f"OPTIONAL POOLED OOF PERFORMANCE: "
+            f"|Actual| <= {EVAL_ABS_TARGET_MAX:.0f}"
+        )
+        print("=" * 78)
+        print(f"Samples used = {len(oof_range)} / {len(oof_predictions)}")
+
+        print(
+            f"MAE  = {range_metrics['MAE']:.4f} "
+            f"[{BOOTSTRAP_CI}% CI: "
+            f"{range_bootstrap_ci['MAE'][0]:.4f}, "
+            f"{range_bootstrap_ci['MAE'][1]:.4f}]"
+        )
+
+        print(
+            f"RMSE = {range_metrics['RMSE']:.4f} "
+            f"[{BOOTSTRAP_CI}% CI: "
+            f"{range_bootstrap_ci['RMSE'][0]:.4f}, "
+            f"{range_bootstrap_ci['RMSE'][1]:.4f}]"
+        )
+
+        print(
+            f"R²   = {range_metrics['R2']:.4f} "
+            f"[{BOOTSTRAP_CI}% CI: "
+            f"{range_bootstrap_ci['R2'][0]:.4f}, "
+            f"{range_bootstrap_ci['R2'][1]:.4f}]"
+        )
+# ============================================================
+# 21-1. 每個 Outer Fold 的 Full Range RMSE
+#       用於後續模型排名與統計檢定
+# ============================================================
+
+MODEL_NAME = "Linear"
+
+# ------------------------------------------------------------
+# 自動判斷 Dataset
+# ------------------------------------------------------------
+file_name_upper = FILE_PATH.upper()
+
+if "P_A" in file_name_upper or "PA" in file_name_upper:
+    dataset_name = "PA"
+
+elif "RATIO" in file_name_upper:
+    dataset_name = "Ratio"
+
+else:
+    dataset_name = "Unknown"
+
+
+# ------------------------------------------------------------
+# 自動判斷 Target
+# ------------------------------------------------------------
+target_upper = TARGET_COLUMN.upper()
+
+if "OVERPOTENTIAL" in target_upper:
+    target_name = "OP"
+
+elif "TAFEL" in target_upper:
+    target_name = "Tafel"
+
+else:
+    target_name = TARGET_COLUMN
+
+
+# ------------------------------------------------------------
+# Full Range 設定
+# ------------------------------------------------------------
+range_name = "Full Range"
+
+
+# ------------------------------------------------------------
+# 計算每個 Outer Fold 的 Full Range RMSE
+# ------------------------------------------------------------
+full_fold_records = []
+
+for fold in range(1, OUTER_FOLDS + 1):
+
+    # 取出該 Outer Fold 的全部 OOF predictions
+    # 不進行任何 target 範圍篩選
+    fold_df = oof_predictions.loc[
+        oof_predictions["Outer_Fold"] == fold
+    ].copy()
+
+    # 計算 Full Range RMSE
+    if len(fold_df) == 0:
+        fold_rmse = np.nan
+
+    else:
+        fold_rmse = np.sqrt(
+            mean_squared_error(
+                fold_df["Actual"],
+                fold_df["Predicted"]
+            )
+        )
+
+    full_fold_records.append({
+        "Model": MODEL_NAME,
+        "Dataset": dataset_name,
+        "Target": target_name,
+        "Range": range_name,
+        "Outer_Fold": fold,
+        "N_Samples": len(fold_df),
+        "RMSE": fold_rmse
+    })
+
+
+# ------------------------------------------------------------
+# 整理成 DataFrame
+# ------------------------------------------------------------
+full_fold_rmse_df = pd.DataFrame(
+    full_fold_records
+)
+
+
+# ------------------------------------------------------------
+# 顯示結果
+# ------------------------------------------------------------
+print("\n" + "=" * 78)
+print("FULL-RANGE RMSE BY OUTER FOLD")
+print("=" * 78)
+
+print(
+    full_fold_rmse_df.to_string(
+        index=False
+    )
+)
+
+
+# ------------------------------------------------------------
+# 自動產生輸出檔名
+# ------------------------------------------------------------
+range_file_name = range_name.replace(" ", "_")
+
+OUTPUT_FILE = (
+    f"{MODEL_NAME}_"
+    f"{dataset_name}_"
+    f"{target_name}_"
+    f"{range_file_name}_"
+    f"outer_fold_RMSE.csv"
+)
+
+
+# ------------------------------------------------------------
+# 輸出 CSV
+# ------------------------------------------------------------
+full_fold_rmse_df.to_csv(
+    OUTPUT_FILE,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print(f"\nSaved as: {OUTPUT_FILE}")
+
+# ============================================================
+# 22. 顯示每個 Outer Fold 選到的最佳超參數
+# ============================================================
+
+print("\n" + "=" * 78)
+print("BEST HYPERPARAMETER BY OUTER FOLD")
+print("=" * 78)
+print(best_params_df.to_string(index=False))
+
+
+# ============================================================
+# 23. OOF Actual vs Predicted scatter plot
+# ============================================================
+
+plt.figure(figsize=(5, 5))
+plt.scatter(
+    y_oof_true,
+    y_oof_pred,
+    alpha=0.7
+)
+
+plot_min = min(y_oof_true.min(), y_oof_pred.min())
+plot_max = max(y_oof_true.max(), y_oof_pred.max())
+
+plt.plot(
+    [plot_min, plot_max],
+    [plot_min, plot_max],
+    "--"
+)
+
+plt.xlabel("Actual Tafel slope (mV/dec)")
+plt.ylabel("Predicted Tafel slope (mV/dec)")
+plt.title("Linear Regression - Pooled OOF Predictions (Ratio)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 24. Inner tuning curve summary plot（Linear Regression 不適用）
+#
+# 若 candidate values 全為數值，畫出每個 outer fold 的 inner mean metric。
+# 若包含 "scale" / "auto" 等字串則跳過。
+# ============================================================
+
+candidate_values_numeric = False  # Linear Regression has no tuning curve
+
+if candidate_values_numeric:
+    plt.figure(figsize=(7, 5))
+
+    metric_column = {
+        "RMSE": "Inner_RMSE_Mean",
+        "MAE": "Inner_MAE_Mean",
+        "R2": "Inner_R2_Mean"
+    }[TUNING_METRIC.upper()]
+
+    for outer_fold in range(1, OUTER_FOLDS + 1):
+        temp = inner_tuning_df.loc[
+            inner_tuning_df["Outer_Fold"] == outer_fold
+        ].copy()
+
+        plt.plot(
+            temp["Candidate_Value"],
+            temp[metric_column],
+            marker="o",
+            label=f"Outer Fold {outer_fold}"
+        )
+
+    plt.xlabel(UNIVARIATE_PARAM_NAME)
+    plt.ylabel(f"Inner CV mean {TUNING_METRIC}")
+    plt.title(
+        f"SVR Univariate Tuning - {UNIVARIATE_PARAM_NAME}"
+    )
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+# ============================================================
+# 25. Final full-data model + SHAP
+#
+# 注意：
+# 1. Nested CV / pooled OOF 用來評估泛化效能。
+# 2. 這裡另外在完整資料上做 Inner-style 3-fold GroupKFold 調參，
+#    只為了決定最終 full-data explanatory model 的超參數。
+# 3. SHAP 不用來計算 OOF performance。
+# ============================================================
+
+def tune_final_model_grouped(
+    X_full,
+    y_full,
+    groups_full,
+    feature_columns,
+    categorical_features
+):
+    """
+    Linear Regression 無需 final hyperparameter tuning。
+    直接回傳固定 ordinary least-squares 設定。
+    """
+    result_df = pd.DataFrame([{
+        "Parameter": "None",
+        "Candidate_Value": "Not applicable",
+        "Inner_MAE_Mean": np.nan,
+        "Inner_MAE_SD": np.nan,
+        "Inner_RMSE_Mean": np.nan,
+        "Inner_RMSE_SD": np.nan,
+        "Inner_R2_Mean": np.nan,
+        "Inner_R2_SD": np.nan
+    }])
+
+    best_params = BASE_PARAMS.copy()
+    best_value = "Not applicable"
+    best_score = np.nan
+    return best_params, best_value, best_score, result_df
+
+
+def calculate_final_model_shap(
+    X_full,
+    y_full,
+    groups_full
+):
+    """
+    1. Full dataset 上做 3-fold literature-grouped tuning
+    2. 用最佳參數 fit 完整資料
+    3. 對 fit 完的 final Linear Regression 做 Kernel SHAP
+    """
+
+    print("\n" + "=" * 78)
+    print("FINAL LINEAR REGRESSION MODEL FOR SHAP")
+    print("=" * 78)
+
+    final_best_params, final_best_value, final_best_score, final_tuning_df = (
+        tune_final_model_grouped(
+            X_full=X_full,
+            y_full=y_full,
+            groups_full=groups_full,
+            feature_columns=FEATURE_COLUMNS_MODEL,
+            categorical_features=CATEGORICAL_FEATURES
+        )
+    )
+
+    print("Linear Regression has no hyperparameter tuning step.")
+    print("Final model will be fit on the full dataset using ordinary least squares.")
+
+    # --------------------------------------------------------
+    # fit final full-data pipeline
+    # --------------------------------------------------------
+    final_pipeline = build_pipeline(
+        FEATURE_COLUMNS_MODEL,
+        CATEGORICAL_FEATURES,
+        final_best_params
+    )
+    final_pipeline.fit(X_full, y_full)
+
+    # --------------------------------------------------------
+    # SHAP 解釋 Linear Regression 本體。先使用已 fit 的 preprocessor transform，
+    # KernelExplainer 直接對數值化後的 SVR model.predict 解釋。
+    # --------------------------------------------------------
+    fitted_preprocessor = final_pipeline.named_steps["preprocess"]
+    fitted_model = final_pipeline.named_steps["model"]
+
+    X_transformed = fitted_preprocessor.transform(X_full)
+    X_transformed = np.asarray(X_transformed, dtype=float)
+
+    numerical_features = [
+        col for col in FEATURE_COLUMNS_MODEL
+        if col not in CATEGORICAL_FEATURES
+    ]
+    transformed_feature_names = numerical_features + CATEGORICAL_FEATURES
+
+    if X_transformed.shape[1] != len(transformed_feature_names):
+        raise ValueError(
+            "SHAP feature-name count does not match transformed feature count."
+        )
+
+    rng = np.random.default_rng(SHAP_RANDOM_STATE)
+
+    if SHAP_EXPLAIN_SIZE is None:
+        explain_idx = np.arange(len(X_transformed))
+    else:
+        n_explain = min(SHAP_EXPLAIN_SIZE, len(X_transformed))
+        explain_idx = np.sort(
+            rng.choice(len(X_transformed), size=n_explain, replace=False)
+        )
+
+    n_background = min(SHAP_BACKGROUND_SIZE, len(X_transformed))
+    background_idx = rng.choice(
+        len(X_transformed),
+        size=n_background,
+        replace=False
+    )
+
+    X_explain = X_transformed[explain_idx]
+    X_background = X_transformed[background_idx]
+
+    print("\nSHAP setup:")
+    print(f"Training samples   : {len(X_transformed)}")
+    print(f"Background samples : {len(X_background)}")
+    print(f"Explained samples  : {len(X_explain)}")
+    print(f"Features           : {len(transformed_feature_names)}")
+
+    explainer = shap.KernelExplainer(
+        fitted_model.predict,
+        X_background
+    )
+
+    shap_values = explainer.shap_values(
+        X_explain,
+        nsamples=SHAP_NSAMPLES
+    )
+    shap_values = np.asarray(shap_values)
+
+    # 原參考程式不在圖中顯示 missing-indicator
+    shap_keep_idx = [
+        i for i, name in enumerate(transformed_feature_names)
+        if name != "IR compensation_missing"
+    ]
+
+    kept_feature_names = [
+        transformed_feature_names[i]
+        for i in shap_keep_idx
+    ]
+
+    kept_shap_values = shap_values[:, shap_keep_idx]
+    kept_X_explain = X_explain[:, shap_keep_idx]
+
+    base_value = explainer.expected_value
+    if np.ndim(base_value) == 0:
+        base_values = np.repeat(float(base_value), len(X_explain))
+    else:
+        base_values = np.repeat(float(np.ravel(base_value)[0]), len(X_explain))
+
+    explanation = shap.Explanation(
+        values=kept_shap_values,
+        base_values=base_values,
+        data=kept_X_explain,
+        feature_names=kept_feature_names
+    )
+
+    mean_abs_shap = np.mean(np.abs(kept_shap_values), axis=0)
+    shap_importance_df = (
+        pd.DataFrame({
+            "Feature": kept_feature_names,
+            "Mean_Abs_SHAP": mean_abs_shap
+        })
+        .sort_values("Mean_Abs_SHAP", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return (
+        final_pipeline,
+        explanation,
+        shap_importance_df,
+        final_tuning_df,
+        final_best_params
+    )
+
+
+def plot_shap_feature_importance(explanation):
+    plt.figure(figsize=(6, 5))
+    shap.plots.bar(
+        explanation,
+        max_display=SHAP_MAX_DISPLAY,
+        show=False
+    )
+
+    fig = plt.gcf()
+    ax = plt.gca()
+
+    for patch in ax.patches:
+        patch.set_facecolor(SHAP_BAR_COLOR)
+        patch.set_edgecolor(SHAP_BAR_COLOR)
+
+    ax.set_xlabel("mean(|SHAP value|)")
+    ax.set_title(f"Linear Regression - Tafel slope SHAP Feature Importance ({REPRESENTATION_NAME})")
+    fig.set_size_inches(6, 5)
+    fig.subplots_adjust(left=0.32, right=0.96, bottom=0.13, top=0.90)
+    plt.show()
+
+
+def plot_shap_beeswarm(explanation):
+    plt.figure(figsize=(7, 5))
+    shap.plots.beeswarm(
+        explanation,
+        max_display=SHAP_MAX_DISPLAY,
+        color=SHAP_CMAP,
+        show=False
+    )
+
+    fig = plt.gcf()
+    ax = plt.gca()
+    ax.set_xlabel("SHAP value (impact on model output)")
+    ax.set_title("Linear Regression - Tafel slope SHAP Summary (Ratio)")
+    fig.set_size_inches(7, 5)
+    fig.subplots_adjust(left=0.32, right=0.90, bottom=0.13, top=0.90)
+    plt.show()
+
+
+if RUN_FINAL_SHAP:
+    (
+        final_linear_pipeline,
+        final_shap_explanation,
+        shap_importance_df,
+        final_tuning_df,
+        final_best_params
+    ) = calculate_final_model_shap(
+        X_full=X,
+        y_full=y,
+        groups_full=groups
+    )
+
+    print("\n" + "=" * 78)
+    print("SHAP FEATURE IMPORTANCE")
+    print("=" * 78)
+    print(shap_importance_df.to_string(index=False))
+
+    plot_shap_feature_importance(final_shap_explanation)
+    plot_shap_beeswarm(final_shap_explanation)
+# ============================================================
+# 26. 完成
+# ============================================================
+
+print("\n" + "=" * 78)
+print("ANALYSIS COMPLETED")
+print("=" * 78)
